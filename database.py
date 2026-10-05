@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -13,6 +14,9 @@ class DomainError(ValueError):
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
+
+# 异文可按字段合并的可变字段
+MERGE_FIELDS = ("proposed_text", "reason")
 
 
 def validate_transcription(text: str) -> str:
@@ -143,6 +147,25 @@ class CollationDB:
               locked_by INTEGER NOT NULL REFERENCES users(id),
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_ops (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              op_id TEXT NOT NULL UNIQUE,
+              batch_id TEXT NOT NULL,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              witness_id INTEGER NOT NULL REFERENCES witnesses(id),
+              variant_id INTEGER REFERENCES variants(id) ON DELETE CASCADE,
+              op_kind TEXT NOT NULL DEFAULT 'variant',
+              base_revision INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','merged','conflict','adjudicated')),
+              merged_fields_json TEXT NOT NULL DEFAULT '[]',
+              conflict_fields_json TEXT NOT NULL DEFAULT '[]',
+              result_revision INTEGER,
+              author_id INTEGER NOT NULL REFERENCES users(id),
+              last_error TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
             );
             """
         )
@@ -336,6 +359,14 @@ class CollationDB:
             raise DomainError(f"版本冲突：当前修订为 {passage['revision']}，提交基于 {expected_revision}")
         return passage, None
 
+    def _gap_count(self, passage_id: int) -> int:
+        """重算段落缺口统计：对齐文本中的 [缺页]/[残损] 标记。"""
+        gaps = 0
+        for row in self.conn.execute("SELECT aligned_text FROM alignments WHERE passage_id=?", (passage_id,)).fetchall():
+            if "[缺页]" in row["aligned_text"] or "[残损]" in row["aligned_text"]:
+                gaps += 1
+        return gaps
+
     def _record_revision(self, passage_id: int, variant_id: int, layer: int, user_id: int) -> int:
         revision = int(self.conn.execute("SELECT COALESCE(MAX(revision_no),0)+1 FROM revisions WHERE passage_id=?", (passage_id,)).fetchone()[0])
         snapshot = {
@@ -345,12 +376,242 @@ class CollationDB:
                 "SELECT a.*,w.siglum,w.kind FROM alignments a JOIN witnesses w ON w.id=a.witness_id WHERE a.passage_id=? ORDER BY a.sort_order",
                 (passage_id,),
             ).fetchall()],
+            "gap_count": self._gap_count(passage_id),
         }
         self.conn.execute(
             "INSERT INTO revisions(passage_id,variant_id,revision_no,layer,snapshot_json,author_id,created_at) VALUES(?,?,?,?,?,?,?)",
             (passage_id, variant_id, revision, layer, json.dumps(snapshot, ensure_ascii=False), user_id, datetime.now().isoformat()),
         )
         return revision
+
+    # ---- 待合并操作（断网编辑、联网合并） ----
+
+    def _validate_op(self, op: dict) -> None:
+        for key in ("op_id", "base_revision", "proposed_text", "reason"):
+            if key not in op:
+                raise DomainError(f"操作缺少字段 {key}")
+        if not str(op["op_id"]).strip():
+            raise DomainError("操作号不能为空")
+        if int(op["base_revision"]) < 0:
+            raise DomainError("基准修订无效")
+
+    def _stage_op(self, passage_id: int, op: dict, user_id: int, batch_id: str):
+        """把操作记成待合并操作；同号重传沿用首次记录（幂等）。"""
+        op_id = str(op["op_id"]).strip()
+        payload = {key: str(op[key]) for key in MERGE_FIELDS}
+        existing = self.conn.execute("SELECT * FROM pending_ops WHERE op_id=?", (op_id,)).fetchone()
+        if existing:
+            # 仍在待处理区的操作允许用重传数据更正后重试
+            if existing["status"] == "pending":
+                self.conn.execute(
+                    "UPDATE pending_ops SET payload_json=?, base_revision=?, witness_id=?, variant_id=?, last_error='', updated_at=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), int(op["base_revision"]),
+                     int(op.get("witness_id", 0) or 0), op.get("variant_id"), datetime.now().isoformat(), existing["id"]),
+                )
+            return self.conn.execute("SELECT * FROM pending_ops WHERE id=?", (existing["id"],)).fetchone()
+        cur = self.conn.execute(
+            "INSERT INTO pending_ops(op_id,batch_id,passage_id,witness_id,variant_id,op_kind,base_revision,payload_json,"
+            "status,author_id,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (op_id, batch_id, passage_id, int(op.get("witness_id", 0) or 0), op.get("variant_id"), "variant",
+             int(op["base_revision"]), json.dumps(payload, ensure_ascii=False), "pending", user_id, "",
+             datetime.now().isoformat(), datetime.now().isoformat()),
+        )
+        return self.conn.execute("SELECT * FROM pending_ops WHERE id=?", (cur.lastrowid,)).fetchone()
+
+    def _op_dict(self, row) -> dict:
+        d = dict(row)
+        d["payload"] = json.loads(d["payload_json"])
+        d["merged_fields"] = json.loads(d["merged_fields_json"])
+        d["conflict_fields"] = json.loads(d["conflict_fields_json"])
+        return d
+
+    def _op_outcome(self, row) -> dict:
+        return {
+            "op_id": row["op_id"],
+            "status": row["status"],
+            "merged_fields": json.loads(row["merged_fields_json"]),
+            "conflict_fields": json.loads(row["conflict_fields_json"]),
+            "result_revision": row["result_revision"],
+            "last_error": row["last_error"],
+        }
+
+    def stage_op(self, passage_id: int, op_id: str, witness_id: int, variant_id,
+                 proposed_text: str, reason: str, base_revision: int, user_id: int) -> str:
+        """把一条改动记成待合并操作（不立即合并），同号重传幂等。"""
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        op = {"op_id": op_id, "witness_id": witness_id, "variant_id": variant_id,
+              "proposed_text": proposed_text, "reason": reason, "base_revision": base_revision}
+        self._validate_op(op)
+        batch_id = f"stage-{datetime.now().strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
+        with self.transaction():
+            row = self._stage_op(passage_id, op, user_id, batch_id)
+        return row["op_id"]
+
+    def merge_batch(self, passage_id: int, ops: list, user_id: int) -> dict:
+        """把一批待合并操作并入段落。
+
+        - 段落锁定：整批停在待处理区，不产生修订。
+        - 字段级合并：没撞上的字段先并入；同一字段被两人同时修改则留两份待裁决。
+        - 合并失败：整批保留在待处理区，可重试；同号重传沿用首次结果。
+        """
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        if not ops:
+            raise DomainError("没有待合并操作")
+        batch_id = f"batch-{datetime.now().strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
+        # 先整批记录（提交），即使后续合并失败也保留待重试
+        staged = []
+        with self.transaction():
+            for op in ops:
+                self._validate_op(op)
+                staged.append(self._stage_op(passage_id, op, user_id, batch_id))
+        results = {}
+        try:
+            with self.transaction():
+                passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+                locked = bool(passage["status"] == "locked" or self.conn.execute(
+                    "SELECT 1 FROM passage_locks WHERE passage_id=?", (passage_id,)).fetchone())
+                if locked:
+                    for row in staged:
+                        results[row["op_id"]] = {"op_id": row["op_id"], "status": "pending",
+                                                 "merged_fields": [], "conflict_fields": [],
+                                                 "result_revision": None, "last_error": "段落已锁定"}
+                else:
+                    # 按变体分组，同字段竞争在组内判定
+                    groups = {}
+                    for row in staged:
+                        if row["status"] != "pending":
+                            results[row["op_id"]] = self._op_outcome(row)
+                            continue
+                        groups.setdefault(row["variant_id"], []).append(row)
+                    for variant_id, rows in groups.items():
+                        results.update(self._process_variant_group(passage, variant_id, rows, user_id))
+                all_pending = locked
+        except DomainError as exc:
+            # 整批回滚：已记录的操作仍在待处理区，可重试
+            for row in staged:
+                results.setdefault(row["op_id"], {"op_id": row["op_id"], "status": "pending",
+                                                   "merged_fields": [], "conflict_fields": [],
+                                                   "result_revision": None, "last_error": str(exc)})
+            return {"ok": False, "all_pending": True, "error": str(exc), "results": results}
+        return {"ok": True, "all_pending": all_pending, "results": results}
+
+    def _apply_fields(self, variant, payload: dict, fields: set) -> int:
+        row = self.conn.execute("SELECT layer FROM variants WHERE id=?", (variant["id"],)).fetchone()
+        new_layer = int(row["layer"]) + 1
+        sets = [f"{key}=?" for key in sorted(fields)]
+        vals = [payload[key] for key in sorted(fields)]
+        sets.append("layer=?")
+        vals.append(new_layer)
+        sets.append("updated_at=?")
+        vals.append(datetime.now().isoformat())
+        vals.append(variant["id"])
+        self.conn.execute(f"UPDATE variants SET {', '.join(sets)} WHERE id=?", vals)
+        return new_layer
+
+    def _process_variant_group(self, passage, variant_id: int, rows: list, user_id: int) -> dict:
+        variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        if not variant or variant["passage_id"] != passage["id"]:
+            raise DomainError("异文记录不存在或不属于本段落")
+        current0 = dict(variant)
+        # 校验并计算每个操作相对其基准修订改动的字段
+        op_changes = {}
+        payloads = {}
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            payload["proposed_text"] = validate_transcription(payload["proposed_text"])
+            payload["reason"] = payload["reason"].strip()
+            if len(payload["reason"]) < 3:
+                raise DomainError("取舍理由至少3个字符")
+            base_rev = self.conn.execute(
+                "SELECT * FROM revisions WHERE passage_id=? AND revision_no=?", (passage["id"], row["base_revision"])).fetchone()
+            if not base_rev:
+                raise DomainError(f"基准修订 {row['base_revision']} 不存在")
+            base_variant = json.loads(base_rev["snapshot_json"])["variant"]
+            payloads[row["op_id"]] = payload
+            op_changes[row["op_id"]] = {f for f in MERGE_FIELDS if str(payload[f]) != str(base_variant.get(f, ""))}
+        # 字段被哪些操作改动：同一字段被两人同时提交即竞争
+        field_changed_by = {}
+        for op_id, changes in op_changes.items():
+            for f in changes:
+                field_changed_by.setdefault(f, []).append(op_id)
+        results = {}
+        for row in rows:
+            payload = payloads[row["op_id"]]
+            base_rev = self.conn.execute(
+                "SELECT * FROM revisions WHERE passage_id=? AND revision_no=?", (passage["id"], row["base_revision"])).fetchone()
+            base_variant = json.loads(base_rev["snapshot_json"])["variant"]
+            # 基准修订到本批处理前已被同事改动的字段
+            concurrent_changed = {f for f in MERGE_FIELDS if str(current0[f]) != str(base_variant.get(f, ""))}
+            mergeable = []
+            conflicted = []
+            for f in MERGE_FIELDS:
+                if f not in op_changes[row["op_id"]]:
+                    continue
+                if f in concurrent_changed or len(field_changed_by.get(f, [])) > 1:
+                    conflicted.append(f)
+                else:
+                    mergeable.append(f)
+            merged_fields = []
+            conflict_fields = []
+            result_revision = None
+            if mergeable:
+                new_layer = self._apply_fields(variant, payload, set(mergeable))
+                result_revision = self._record_revision(passage["id"], variant["id"], new_layer, user_id)
+                self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?",
+                                   (result_revision, user_id, datetime.now().isoformat(), passage["id"]))
+                merged_fields = sorted(mergeable)
+            if conflicted:
+                conflict_fields = sorted(conflicted)
+                status = "conflict"
+            else:
+                status = "merged"
+            self.conn.execute(
+                "UPDATE pending_ops SET status=?, merged_fields_json=?, conflict_fields_json=?, result_revision=?, "
+                "last_error='', updated_at=? WHERE id=?",
+                (status, json.dumps(merged_fields, ensure_ascii=False), json.dumps(conflict_fields, ensure_ascii=False),
+                 result_revision, datetime.now().isoformat(), row["id"]))
+            results[row["op_id"]] = {"op_id": row["op_id"], "status": status, "merged_fields": merged_fields,
+                                      "conflict_fields": conflict_fields, "result_revision": result_revision, "last_error": ""}
+        return results
+
+    def adjudicate_variant(self, passage_id: int, variant_id: int, proposed_text: str, reason: str, user_id: int) -> dict:
+        """负责人对冲突字段作出裁决，生成新修订和快照。"""
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        self._require_owner(passage["work_id"], user_id)
+        variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        if not variant or variant["passage_id"] != passage_id:
+            raise DomainError("异文不存在或不属于本段落")
+        text = validate_transcription(proposed_text)
+        if len(reason.strip()) < 3:
+            raise DomainError("取舍理由至少3个字符")
+        with self.transaction():
+            new_layer = int(variant["layer"]) + 1
+            self.conn.execute(
+                "UPDATE variants SET proposed_text=?, reason=?, layer=?, updated_at=? WHERE id=?",
+                (text, reason.strip(), new_layer, datetime.now().isoformat(), variant_id))
+            revision = self._record_revision(passage_id, variant_id, new_layer, user_id)
+            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?",
+                               (revision, user_id, datetime.now().isoformat(), passage_id))
+            self.conn.execute(
+                "UPDATE pending_ops SET status='adjudicated', result_revision=?, updated_at=? "
+                "WHERE passage_id=? AND variant_id=? AND status='conflict'",
+                (revision, datetime.now().isoformat(), passage_id, variant_id))
+        return {"revision": revision, "layer": new_layer}
+
+    def list_pending_ops(self, passage_id: int, user_id: int) -> list:
+        passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage or not self.can_view_work(passage["work_id"], user_id):
+            raise DomainError("无权查看该段落的待合并操作")
+        rows = self.conn.execute(
+            "SELECT * FROM pending_ops WHERE passage_id=? AND status IN ('pending','conflict') ORDER BY id",
+            (passage_id,)).fetchall()
+        return [self._op_dict(r) for r in rows]
 
     def add_note(self, variant_id: int, body: str, author_id: int) -> int:
         variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
@@ -420,4 +681,5 @@ class CollationDB:
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
+            "pending_ops": [self._op_dict(r) for r in self.conn.execute("SELECT * FROM pending_ops ORDER BY id")],
         }

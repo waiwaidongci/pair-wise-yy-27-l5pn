@@ -25,6 +25,8 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/state": return self._json(200,self.db.snapshot())
             if len(parts)==5 and parts[:2]==["api","passages"] and parts[3]=="snapshots":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="pending":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"ok":True,"ops":self.db.list_pending_ops(int(parts[2]),uid)})
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -44,6 +46,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="ops":
+                op_id=self.db.stage_op(int(parts[2]),str(b.get("op_id","")),int(b.get("witness_id",0) or 0),b.get("variant_id"),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("base_revision",0)),int(b.get("user_id",0)))
+                return self._json(201,{"ok":True,"op_id":op_id})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="merge":
+                ops=b.get("ops");
+                if not isinstance(ops,list): raise DomainError("ops 必须是数组")
+                return self._json(200,self.db.merge_batch(int(parts[2]),ops,int(b.get("user_id",0))))
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="adjudicate":
+                return self._json(200,self.db.adjudicate_variant(int(parts[2]),int(b.get("variant_id",0)),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0))))
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():

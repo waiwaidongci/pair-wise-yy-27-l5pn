@@ -19,6 +19,11 @@ python -m unittest discover -s tests -v
 - `[缺页]`、`[不可辨]`、`[残损]` 等标记会参与校勘稿导出和缺口统计，不匹配的方括号会拒绝保存。
 - 每次新增或修改异文都会产生递增修订号和 JSON 快照；提交必须携带 `expected_revision`，旧页面不能覆盖新层。
 - 锁定段落由负责人执行，锁定后任何新修订都会被拒绝。
+- 断网工作站的改动先记成「待合并操作」：带操作号 `op_id` 和基准修订 `base_revision`，联网后按批合并。
+- 字段级合并：没撞上的字段先并入；两人同时提交同一字段则该字段不擅自并入，留两份待负责人裁决。
+- 合并失败整批保留在待处理区可重试；同号重传沿用首次结果，不重复并入。
+- 段落锁定时整批停在待处理区，不产生修订。
+- 负责人裁决后生成新修订和快照，缺口统计在新快照中重算，校勘稿采用实际并入版本。
 
 ## 主要接口
 
@@ -27,6 +32,10 @@ python -m unittest discover -s tests -v
 - `POST /api/works/{id}/passages`、`POST /api/works/{id}/access`
 - `POST /api/alignments`
 - `POST /api/variants`、`POST /api/variants/{id}/revisions`
+- `POST /api/passages/{id}/ops`：把改动记成待合并操作（`op_id`、`base_revision`、`proposed_text`、`reason`）
+- `POST /api/passages/{id}/merge`：联网合并一批操作（`ops` 数组），按字段并入，撞字段留待裁决
+- `POST /api/passages/{id}/adjudicate`：负责人对冲突字段裁决，生成新修订和快照
+- `GET /api/passages/{id}/pending?user_id=...`：看待处理区（待合并 / 待裁决）的操作
 - `GET /api/passages/{id}/snapshots/{revision}?user_id=...`
 - `POST /api/passages/{id}/lock`
 - `GET /api/works/{id}/collation?user_id=...`
