@@ -27,6 +27,14 @@ class Handler(BaseHTTPRequestHandler):
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="gap-count":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.gap_count(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="sync-batches":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"batches":self.db.list_pending_batches(int(parts[2]))})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="conflicts":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"conflicts":self.db.list_pending_conflicts(int(parts[2]),uid)})
+            if len(parts)==3 and parts[0]=="api" and parts[1]=="sync-batches":
+                return self._json(200,self.db.get_batch(int(parts[2])))
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -44,6 +52,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="sync":
+                res=self.db.submit_sync_batch(str(b.get("batch_id",b.get("batch_uuid",""))),int(parts[2]),int(b.get("user_id",0)),list(b.get("operations",[])),bool(b.get("auto_merge",True)))
+                return self._json(202 if res.get("status") in ("blocked","failed","pending") else 200,{"ok":True,"batch":res})
+            if len(parts)==4 and parts[:2]==["api","sync-batches"] and parts[3]=="retry":
+                return self._json(200,{"ok":True,"batch":self.db.retry_batch(int(parts[2]),int(b.get("user_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","conflicts"] and parts[3]=="resolve":
+                res=self.db.resolve_conflict(int(parts[2]),int(b.get("user_id",0)),b.get("winning_candidate_id"),b.get("custom_value"))
+                return self._json(200,{"ok":True,**res})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():
